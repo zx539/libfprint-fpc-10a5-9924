@@ -1,0 +1,17 @@
+# Local upstream checkout used while applying/building the patch
+libfprint-9924/
+
+# Local build and packaging output
+electron-app/node_modules/
+electron-app/dist/
+electron-app/dist-electron/
+electron-app/release/
+
+# Python cache and editor files
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+*.swp
+
