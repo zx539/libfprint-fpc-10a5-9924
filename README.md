@@ -96,6 +96,18 @@ fprintd-delete "$USER"
 fprintd-delete "$USER" -f right-index-finger
 ```
 
+## Second enrollment reports `enroll-duplicate`
+
+Early versions of this patch accepted an on-chip match as the only registered finger even when their identities differed. This caused another finger already stored on the sensor to be incorrectly rejected as a duplicate. The updated driver requires matching identities and reuses the sensor's actual identity when registering an existing on-chip template.
+
+After upgrading from an earlier patch, re-enroll the previously registered finger to replace its old identity mapping, then enroll other fingers. Rebuild and install libfprint for this fix; updating the GUI RPM alone does not update the driver.
+
+After building the driver, run the callback regression tests without a sensor:
+
+```bash
+python3 scripts/test-fpc-identity.py ./libfprint-9924
+```
+
 ## Security / TLS Status
 
 - Windows uses additional secure-auth/TLS-related plumbing (notably around `0x64/0x65/0x6C/0x6D`) in the vendor stack.

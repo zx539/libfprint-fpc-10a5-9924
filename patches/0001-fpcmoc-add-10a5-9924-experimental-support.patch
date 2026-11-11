@@ -1,5 +1,5 @@
 diff --git a/libfprint/drivers/fpcmoc/fpc.c b/libfprint/drivers/fpcmoc/fpc.c
-index 466a809..1b19775 100644
+index 466a809..3423e5b 100644
 --- a/libfprint/drivers/fpcmoc/fpc.c
 +++ b/libfprint/drivers/fpcmoc/fpc.c
 @@ -40,9 +40,13 @@ struct _FpiDeviceFpcMoc
@@ -88,7 +88,7 @@ index 466a809..1b19775 100644
  
    if (*finger != FPC_SUBTYPE_RESERVED)
      return FALSE;
-@@ -567,33 +610,66 @@ parse_print_data (GVariant      *data,
+@@ -567,33 +610,69 @@ parse_print_data (GVariant      *data,
   *  fpc_template_xxx Function
   *
   *****************************************************************************/
@@ -129,6 +129,7 @@ index 466a809..1b19775 100644
 +{
    GVariant *data;
    GVariant *uid;
++  FpiPrintType print_type;
    g_autofree gchar *userid = NULL;
  
 -  userid = g_strndup ((gchar *) fid_data->identity, fid_data->identity_size);
@@ -150,7 +151,10 @@ index 466a809..1b19775 100644
 +                        subfactor,
                          uid);
  
-   fpi_print_set_type (print, FPI_PRINT_RAW);
+-  fpi_print_set_type (print, FPI_PRINT_RAW);
++  g_object_get (print, "fpi-type", &print_type, NULL);
++  if (print_type == FPI_PRINT_UNDEFINED)
++    fpi_print_set_type (print, FPI_PRINT_RAW);
    fpi_print_set_device_stored (print, TRUE);
    g_object_set (print, "fpi-data", data, NULL);
    g_object_set (print, "description", userid, NULL);
@@ -162,7 +166,7 @@ index 466a809..1b19775 100644
  }
  
  static void
-@@ -604,6 +680,7 @@ fpc_template_list_cb (FpiDeviceFpcMoc *self,
+@@ -604,6 +683,7 @@ fpc_template_list_cb (FpiDeviceFpcMoc *self,
    g_autoptr(GPtrArray) list_result = NULL;
    FpDevice *device = FP_DEVICE (self);
    pfpc_cmd_response_t presp = NULL;
@@ -170,7 +174,7 @@ index 466a809..1b19775 100644
  
    if (error)
      {
-@@ -651,13 +728,55 @@ fpc_template_list_cb (FpiDeviceFpcMoc *self,
+@@ -651,13 +731,55 @@ fpc_template_list_cb (FpiDeviceFpcMoc *self,
        return;
      }
  
@@ -228,7 +232,7 @@ index 466a809..1b19775 100644
          {
            fp_info ("Incompatible template found (0x%x, 0x%x)",
                     fid_data->subfactor, fid_data->identity_type);
-@@ -739,6 +858,13 @@ fpc_enroll_update_cb (FpiDeviceFpcMoc *self,
+@@ -739,6 +861,13 @@ fpc_enroll_update_cb (FpiDeviceFpcMoc *self,
        break;
  
      case FPC_ENROL_STATUS_FAILED_ALREADY_ENROLED:
@@ -242,7 +246,7 @@ index 466a809..1b19775 100644
        error = fpi_device_error_new (FP_DEVICE_ERROR_DATA_DUPLICATE);
        break;
  
-@@ -868,10 +994,19 @@ fpc_enroll_check_duplicate_cb (FpiDeviceFpcMoc *self,
+@@ -868,10 +997,36 @@ fpc_enroll_check_duplicate_cb (FpiDeviceFpcMoc *self,
    if (check_data (data, &error))
      {
        presp = (FPC_IDENTIFY *) data;
@@ -257,15 +261,32 @@ index 466a809..1b19775 100644
          {
 +          if (self->is_9924)
 +            {
-+              fp_warn ("FPC9924 debug: ignoring duplicate check match because 10a5:9924 may report hidden/stale on-chip templates");
-+              fpi_ssm_next_state (self->task_ssm);
++              FpPrint *print = NULL;
++
++              /* fprintd has already checked its registered templates. A match
++               * here can be a template left on the chip by a previous install.
++               * Reuse the identity the sensor actually returns; binding a new
++               * alias does not change that identity on 9924 firmware.
++               */
++              fpi_device_get_enroll_data (FP_DEVICE (self), &print);
++              fpc_print_set_identity_data (self,
++                                           print,
++                                           presp->subfactor,
++                                           presp->identity_type,
++                                           presp->data,
++                                           presp->identity_size,
++                                           FALSE);
++              /* This template is already persisted. STORE_DB without a new
++               * binding fails with -13 on this firmware.
++               */
++              fpi_ssm_jump_to_state (self->task_ssm, FPC_ENROLL_REFRESH_ENUM);
 +              return;
 +            }
 +
            fp_info ("%s Got a duplicated template", G_STRFUNC);
            error = fpi_device_error_new (FP_DEVICE_ERROR_DATA_DUPLICATE);
          }
-@@ -931,8 +1066,85 @@ fpc_enroll_commit_cb (FpiDeviceFpcMoc *self,
+@@ -931,8 +1086,75 @@ fpc_enroll_commit_cb (FpiDeviceFpcMoc *self,
      }
    else
      {
@@ -282,7 +303,6 @@ index 466a809..1b19775 100644
 +                       void            *data,
 +                       GError          *error)
 +{
-+  fpc_fid_data_t *fallback = NULL;
 +  fpc_fid_data_t *selected = NULL;
 +  pfpc_cmd_response_t presp = NULL;
 +
@@ -317,19 +337,10 @@ index 466a809..1b19775 100644
 +          self->pending_enroll_identity_valid &&
 +          memcmp (fid_data->identity, self->pending_enroll_identity, 16) == 0)
 +        {
-+          fallback = fid_data;
-+          continue;
-+        }
-+
-+      if (fid_data->identity_type == 4 && fid_data->identity_size == 32)
-+        {
 +          selected = fid_data;
 +          break;
 +        }
-     }
-+
-+  if (selected == NULL)
-+    selected = fallback;
++    }
 +
 +  if (selected != NULL)
 +    {
@@ -346,13 +357,13 @@ index 466a809..1b19775 100644
 +      fp_info ("FPC9924 enrollment result refreshed to type=%u size=%u",
 +               selected->identity_type,
 +               selected->identity_size);
-+    }
+     }
 +
 +  fpi_ssm_mark_completed (self->task_ssm);
  }
  
  
-@@ -1070,20 +1282,48 @@ fpc_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
+@@ -1070,20 +1292,48 @@ fpc_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
          GVariant *fpi_data = NULL;
          GVariant *uid = NULL;
          guint finger = FPC_SUBTYPE_RESERVED;
@@ -408,7 +419,7 @@ index 466a809..1b19775 100644
                                           1);
          fpi_data = g_variant_new ("(y@ay)",
                                    finger,
-@@ -1092,17 +1332,16 @@ fpc_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
+@@ -1092,17 +1342,16 @@ fpc_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
          fpi_print_set_type (print, FPI_PRINT_RAW);
          fpi_print_set_device_stored (print, TRUE);
          g_object_set (print, "fpi-data", fpi_data, NULL);
@@ -431,7 +442,7 @@ index 466a809..1b19775 100644
  
          cmd_data.cmdtype = FPC_CMDTYPE_TO_DEVICE;
          cmd_data.request = FPC_CMD_BIND_IDENTITY;
-@@ -1131,6 +1370,36 @@ fpc_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
+@@ -1131,6 +1380,36 @@ fpc_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
        }
        break;
  
@@ -468,7 +479,7 @@ index 466a809..1b19775 100644
      case FPC_ENROLL_DICARD:
        {
          cmd_data.cmdtype = FPC_CMDTYPE_TO_DEVICE;
-@@ -1179,11 +1448,14 @@ fpc_enroll_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+@@ -1179,11 +1458,14 @@ fpc_enroll_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
      {
        fpi_device_enroll_complete (dev, NULL, g_steal_pointer (&error));
        self->task_ssm = NULL;
@@ -483,7 +494,7 @@ index 466a809..1b19775 100644
    self->task_ssm = NULL;
  }
  
-@@ -1217,9 +1489,31 @@ fpc_verify_cb (FpiDeviceFpcMoc *self,
+@@ -1217,9 +1499,31 @@ fpc_verify_cb (FpiDeviceFpcMoc *self,
    g_assert (current_action == FPI_DEVICE_ACTION_VERIFY ||
              current_action == FPI_DEVICE_ACTION_IDENTIFY);
  
@@ -518,7 +529,7 @@ index 466a809..1b19775 100644
      {
        FpPrint *match = NULL;
        FpPrint *print = NULL;
-@@ -1250,6 +1544,36 @@ fpc_verify_cb (FpiDeviceFpcMoc *self,
+@@ -1250,6 +1554,36 @@ fpc_verify_cb (FpiDeviceFpcMoc *self,
          {
            print = g_ptr_array_index (templates, cnt);
  
@@ -555,21 +566,7 @@ index 466a809..1b19775 100644
            if (fp_print_equal (print, match))
              {
                found = TRUE;
-@@ -1257,6 +1581,13 @@ fpc_verify_cb (FpiDeviceFpcMoc *self,
-             }
-         }
- 
-+      if (!found && self->is_9924 && templates->len == 1)
-+        {
-+          print = g_ptr_array_index (templates, 0);
-+          fp_warn ("FPC9924 debug: accepting successful on-chip match for the only candidate despite identity mismatch");
-+          found = TRUE;
-+        }
-+
-       if (found)
-         {
-           if (current_action == FPI_DEVICE_ACTION_VERIFY)
-@@ -1478,6 +1809,48 @@ fpc_clear_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+@@ -1478,6 +1812,48 @@ fpc_clear_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   *
   *****************************************************************************/
  
@@ -618,7 +615,7 @@ index 466a809..1b19775 100644
  static void
  fpc_init_load_db_cb (FpiDeviceFpcMoc *self,
                       void            *data,
-@@ -1533,12 +1906,41 @@ static void
+@@ -1533,12 +1909,41 @@ static void
  fpc_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
  {
    FpiDeviceFpcMoc *self = FPI_DEVICE_FPCMOC (device);
@@ -661,7 +658,7 @@ index 466a809..1b19775 100644
        cmd_data.cmdtype = FPC_CMDTYPE_TO_DEVICE_EVTDATA;
        cmd_data.request = FPC_CMD_INIT;
        cmd_data.value = 0x1;
-@@ -1546,7 +1948,54 @@ fpc_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
+@@ -1546,7 +1951,54 @@ fpc_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
        cmd_data.data = (guint8 *) &session_id;
        cmd_data.data_len = sizeof (session_id);
        cmd_data.callback = fpc_evt_cb;
@@ -716,7 +713,7 @@ index 466a809..1b19775 100644
        fpc_sensor_cmd (self, FALSE, &cmd_data);
        break;
  
-@@ -1635,6 +2084,8 @@ fpc_dev_probe (FpDevice *device)
+@@ -1635,6 +2087,8 @@ fpc_dev_probe (FpDevice *device)
      }
  
    product_id = g_usb_device_get_pid (usb_dev);
@@ -725,7 +722,7 @@ index 466a809..1b19775 100644
    /* Reserved for customer enroll scheme */
    self->max_immobile_stage = 0;   /* By default is not customer enrollment */
    switch (product_id)
-@@ -1648,6 +2099,7 @@ fpc_dev_probe (FpDevice *device)
+@@ -1648,6 +2102,7 @@ fpc_dev_probe (FpDevice *device)
      case 0x9524:
      case 0x9544:
      case 0xC844:
@@ -733,7 +730,7 @@ index 466a809..1b19775 100644
        self->max_enroll_stage = MAX_ENROLL_SAMPLES;
        break;
  
-@@ -1696,6 +2148,7 @@ fpc_dev_close (FpDevice *device)
+@@ -1696,6 +2151,7 @@ fpc_dev_close (FpDevice *device)
  
    fp_dbg ("%s enter -->", G_STRFUNC);
    g_clear_pointer (&self->dbid, g_free);
@@ -741,7 +738,7 @@ index 466a809..1b19775 100644
    g_cancellable_cancel (self->interrupt_cancellable);
    g_clear_object (&self->interrupt_cancellable);
    fpc_dev_release_interface (self, NULL);
-@@ -1724,6 +2177,7 @@ fpc_dev_enroll (FpDevice *device)
+@@ -1724,6 +2180,7 @@ fpc_dev_enroll (FpDevice *device)
  
    self->enroll_stage = 0;
    self->immobile_stage = 0;
@@ -749,7 +746,7 @@ index 466a809..1b19775 100644
    self->task_ssm = fpi_ssm_new_full (device, fpc_enroll_sm_run_state,
                                       FPC_ENROLL_NUM_STATES,
                                       FPC_ENROLL_DICARD,
-@@ -1836,7 +2290,7 @@ fpc_dev_template_delete (FpDevice *device)
+@@ -1836,7 +2293,7 @@ fpc_dev_template_delete (FpDevice *device)
  
    g_object_get (print, "fpi-data", &fpi_data, NULL);
  
@@ -758,7 +755,7 @@ index 466a809..1b19775 100644
      {
        fpi_device_delete_complete (device,
                                    fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
-@@ -1844,7 +2298,10 @@ fpc_dev_template_delete (FpDevice *device)
+@@ -1844,7 +2301,10 @@ fpc_dev_template_delete (FpDevice *device)
      }
  
    data_len = sizeof (FPC_FID_DATA);
