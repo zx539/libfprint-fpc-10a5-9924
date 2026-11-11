@@ -35,6 +35,18 @@ export interface OperationResult {
   ok: boolean;
   message: string;
   output?: string;
+  code?: string;
+}
+
+export interface OperationProgress {
+  operationId: string;
+  mode: "enroll" | "verify";
+  phase: "waiting" | "sample" | "retry" | "saving" | "success" | "error" | "cancelled";
+  completedStages: number;
+  totalStages: number | null;
+  percent: number | null;
+  message: string;
+  code?: string;
 }
 
 export interface DiagnosticItem {
@@ -54,9 +66,10 @@ export interface DiagnosticsReport {
 export interface FingerprintApi {
   getStatus(): Promise<SystemStatus>;
   listFingerprints(): Promise<FingerprintEntry[]>;
-  enroll(finger: FingerName, label?: string): Promise<OperationResult>;
-  verify(finger?: FingerName): Promise<OperationResult>;
-  cancel(): Promise<OperationResult>;
+  enroll(finger: FingerName, label?: string, operationId?: string): Promise<OperationResult>;
+  verify(finger?: FingerName, operationId?: string): Promise<OperationResult>;
+  cancel(operationId?: string): Promise<OperationResult>;
+  onProgress(listener: (progress: OperationProgress) => void): () => void;
   deleteFingerprint(id: string): Promise<OperationResult>;
   renameFingerprint(id: string, label: string): Promise<OperationResult>;
   deleteAll(): Promise<OperationResult>;

@@ -1,6 +1,6 @@
 {
   "name": "fedora-fingerprint-manager",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "author": "Fedora Fingerprint Manager contributors",
   "homepage": "https://github.com/Terrydaktal/libfprint-fpc-10a5-9924",
@@ -9,6 +9,8 @@
   "scripts": {
     "dev": "npm run build:electron && concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build:electron": "tsc -p tsconfig.electron.json",
+    "test": "npm run build:electron && node --test tests/*.test.cjs",
+    "test:ui": "npm run build && electron --no-sandbox scripts/smoke-ui.cjs",
     "build": "tsc --noEmit && vite build && tsc -p tsconfig.electron.json",
     "start": "electron .",
     "preview": "vite preview",

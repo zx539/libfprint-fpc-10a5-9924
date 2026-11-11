@@ -179,4 +179,8 @@ sudo dnf install -y ./release/fedora-fingerprint-manager-*.rpm
 
 The RPM installs the Electron application and declares runtime dependencies on `fprintd`, `polkit`, and `usbutils`. The patched `libfprint` driver itself remains installed by the separate libfprint workflow above.
 
+Version 0.2.0 adds live enrollment percentages and sample counts, a progress ring, scan and sample animations, retry guidance, translated errors with raw details, and cancellation that waits for the native process to stop. Progress uses the device's stage count; it reaches 100% only after confirmed success. Reduced motion preferences are supported. Run `npm test` for operation tests and `npm run test:ui` for Electron UI checks using simulated fingerprints.
+
+The multi-fingerprint bug investigation and fix are documented in [Learn/bug-fixed/FPC9924-多指纹录入失败复盘.md](Learn/bug-fixed/FPC9924-多指纹录入失败复盘.md).
+
 录入和验证都会打开带动态指纹扫描线的模态窗口；删除单个模板和清空模板会打开 GNOME 风格二次确认窗口。应用应以当前登录用户运行，不要使用 `sudo npm run dev`。

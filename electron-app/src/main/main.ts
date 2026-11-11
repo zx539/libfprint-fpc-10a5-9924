@@ -1,16 +1,21 @@
 import { app, BrowserWindow, ipcMain, session } from "electron";
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { execFile } from "node:child_process";
+import { systemBus } from "dbus-next";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type {
   DiagnosticItem, DiagnosticsReport, FingerName, FingerprintEntry,
-  OperationResult, SystemStatus,
+  OperationProgress, OperationResult, SystemStatus,
 } from "../shared/types";
+import { FingerprintOperations } from "./fingerprintOperation";
 
 const exec = promisify(execFile);
-let activeOperation: ChildProcess | null = null;
+const operations = new FingerprintOperations();
+let cachedFingerprints: FingerprintEntry[] = [];
+let enrollmentStages: number | null = null;
+let fingerprintRead: Promise<FingerprintEntry[]> | null = null;
 const USER = os.userInfo().username;
 const FINGER_LABELS: Record<FingerName, string> = {
   "left-thumb": "左手拇指", "left-index-finger": "左手食指", "left-middle-finger": "左手中指",
@@ -39,16 +44,7 @@ async function command(name: string, args: string[] = [], timeout = 180_000): Pr
 }
 
 async function commandResult(name: string, args: string[], timeout = 180_000): Promise<OperationResult> {
-  return new Promise((resolve) => {
-    const child = spawn(name, args, { env: { ...process.env, LC_ALL: "C", LANG: "C" } });
-    activeOperation = child;
-    let stdout = ""; let stderr = "";
-    const timer = setTimeout(() => child.kill("SIGTERM"), timeout);
-    child.stdout?.on("data", (data: Buffer) => { stdout += data.toString(); });
-    child.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
-    child.on("error", (error) => { clearTimeout(timer); activeOperation = null; resolve({ ok: false, message: error.message, output: stderr || stdout }); });
-    child.on("close", (code) => { clearTimeout(timer); activeOperation = null; resolve(code === 0 ? { ok: true, message: "操作成功", output: stdout || stderr } : { ok: false, message: stderr.trim() || stdout.trim() || "操作失败", output: stdout || stderr }); });
-  });
+  return operations.run({ command: name, args, timeout });
 }
 
 async function serviceState(): Promise<SystemStatus["service"]> {
@@ -70,38 +66,60 @@ async function usbDevice(): Promise<SystemStatus["device"]> {
   } catch { return null; }
 }
 
-async function dbusDeviceProbe(): Promise<boolean> {
-  // The service is queried through D-Bus first. CLI probing remains the fallback
-  // because older fprintd versions expose different optional properties.
+async function dbusDeviceProbe(): Promise<{ ready: boolean; stages: number | null }> {
+  const bus = systemBus();
+  bus.on("error", () => { /* Report connection failures through the probe result. */ });
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const dbus = require("dbus-next") as { systemBus: () => { getProxyObject: (service: string, objectPath: string) => Promise<{ getInterface: (name: string) => { GetDevices: () => Promise<unknown[]> } }>; disconnect: () => void } };
-    const bus = dbus.systemBus();
-    const object = await bus.getProxyObject("net.reactivated.Fprint", "/net/reactivated/Fprint/Manager");
-    const manager = object.getInterface("net.reactivated.Fprint.Manager") as { GetDevices: () => Promise<unknown[]> };
-    const devices = await manager.GetDevices();
+    return await Promise.race([
+      (async () => {
+        const object = await bus.getProxyObject("net.reactivated.Fprint", "/net/reactivated/Fprint/Manager");
+        const devices: string[] = await object.getInterface("net.reactivated.Fprint.Manager").GetDevices();
+        if (!devices.length) return { ready: false, stages: null };
+        try {
+          const device = await bus.getProxyObject("net.reactivated.Fprint", devices[0]);
+          const value = await device.getInterface("org.freedesktop.DBus.Properties").Get("net.reactivated.Fprint.Device", "num-enroll-stages");
+          const stages = Number(value.value);
+          return { ready: true, stages: Number.isInteger(stages) && stages > 0 ? stages : null };
+        } catch { return { ready: true, stages: null }; }
+      })(),
+      new Promise<{ ready: boolean; stages: null }>((resolve) => {
+        timer = setTimeout(() => resolve({ ready: false, stages: null }), 3_000);
+      }),
+    ]);
+  } catch { return { ready: false, stages: null }; }
+  finally {
+    clearTimeout(timer);
     bus.disconnect();
-    return devices.length > 0;
-  } catch { return false; }
+  }
 }
 
 async function listFingerprints(): Promise<FingerprintEntry[]> {
-  const metadata = await readMetadata();
-  try {
-    const output = await command("fprintd-list", [USER], 20_000);
-    return SUPPORTED_FINGERS.filter((finger) => new RegExp(`\\b${finger}\\b`, "i").test(output)).map((finger) => ({
-      id: finger,
-      finger,
-      label: metadata.labels[finger] || FINGER_LABELS[finger],
-      enrolledAt: metadata.enrolledAt[finger] || null,
-    }));
-  } catch { return []; }
+  // fprintd-list can Claim the device. Polling must not compete with capture.
+  if (operations.busy) return cachedFingerprints;
+  if (fingerprintRead) return fingerprintRead;
+  fingerprintRead = (async () => {
+    const metadata = await readMetadata();
+    if (operations.busy) return cachedFingerprints;
+    try {
+      const output = await command("fprintd-list", [USER], 20_000);
+      cachedFingerprints = SUPPORTED_FINGERS.filter((finger) => new RegExp(`\\b${finger}\\b`, "i").test(output)).map((finger) => ({
+        id: finger, finger,
+        label: metadata.labels[finger] || FINGER_LABELS[finger],
+        enrolledAt: metadata.enrolledAt[finger] || null,
+      }));
+    } catch { /* Retain the last known list on transient device contention. */ }
+    return cachedFingerprints;
+  })();
+  try { return await fingerprintRead; }
+  finally { fingerprintRead = null; }
 }
 
 async function getStatus(): Promise<SystemStatus> {
   const [device, service, fingerprints] = await Promise.all([usbDevice(), serviceState(), listFingerprints()]);
-  const dbusReady = await dbusDeviceProbe();
-  const actualDevice = device || (dbusReady ? { vendor: "fprintd", model: "D-Bus 指纹设备", serial: null, usbId: null, maxPrints: 10, state: "ready" as const } : null);
+  const dbusProbe = await dbusDeviceProbe();
+  enrollmentStages = dbusProbe.stages;
+  const actualDevice = device || (dbusProbe.ready ? { vendor: "fprintd", model: "D-Bus 指纹设备", serial: null, usbId: null, maxPrints: 10, state: "ready" as const } : null);
   let version: string | null = null;
   try { version = (await command("rpm", ["-q", "libfprint"], 10_000)).trim(); } catch { /* optional */ }
   return { device: actualDevice, service, enrolledCount: fingerprints.length, maxPrints: actualDevice?.maxPrints || 10, username: USER, version };
@@ -110,8 +128,12 @@ async function getStatus(): Promise<SystemStatus> {
 function registerHandlers(): void {
   ipcMain.handle("fingerprint:status", getStatus);
   ipcMain.handle("fingerprint:list", listFingerprints);
-  ipcMain.handle("fingerprint:enroll", async (_event, payload: { finger: FingerName; label?: string }) => {
-    const result = await commandResult("fprintd-enroll", ["-f", payload.finger, USER]);
+  const publish = (event: Electron.IpcMainInvokeEvent) => (progress: OperationProgress) => {
+    if (!event.sender.isDestroyed()) event.sender.send("fingerprint:progress", progress);
+  };
+  ipcMain.handle("fingerprint:enroll", async (event, payload: { finger: FingerName; label?: string; operationId?: string }) => {
+    const result = await operations.run({ command: "fprintd-enroll", args: ["-f", payload.finger, USER],
+      mode: "enroll", operationId: payload.operationId, totalStages: enrollmentStages, onProgress: publish(event) });
     if (result.ok) {
       const metadata = await readMetadata();
       metadata.labels[payload.finger] = payload.label?.trim() || FINGER_LABELS[payload.finger];
@@ -120,8 +142,11 @@ function registerHandlers(): void {
     }
     return result;
   });
-  ipcMain.handle("fingerprint:verify", async (_event, payload: { finger?: FingerName }) => commandResult("fprintd-verify", payload.finger ? ["-f", payload.finger, USER] : [USER]));
-  ipcMain.handle("fingerprint:cancel", async () => { if (activeOperation) { activeOperation.kill("SIGINT"); return { ok: true, message: "操作已取消" }; } return { ok: true, message: "没有正在进行的操作" }; });
+  ipcMain.handle("fingerprint:verify", (event, payload: { finger?: FingerName; operationId?: string }) => operations.run({
+    command: "fprintd-verify", args: payload.finger ? ["-f", payload.finger, USER] : [USER],
+    mode: "verify", operationId: payload.operationId, onProgress: publish(event),
+  }));
+  ipcMain.handle("fingerprint:cancel", (_event, operationId?: string) => operations.cancel(operationId));
   ipcMain.handle("fingerprint:delete", async (_event, id: string) => {
     const result = await commandResult("fprintd-delete", [USER, "-f", id]);
     if (result.ok) { const metadata = await readMetadata(); delete metadata.labels[id]; delete metadata.enrolledAt[id]; await writeMetadata(metadata); }
@@ -176,3 +201,11 @@ function createWindow(): void {
 
 app.whenReady().then(() => { session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false)); registerHandlers(); createWindow(); app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); }); });
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
+let waitingToQuit = false;
+app.on("before-quit", (event) => {
+  if (!operations.busy) return;
+  event.preventDefault();
+  if (waitingToQuit) return;
+  waitingToQuit = true;
+  void operations.cancel().finally(() => app.quit());
+});
