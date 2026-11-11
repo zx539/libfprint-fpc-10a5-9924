@@ -1,6 +1,6 @@
 {
   "name": "fedora-fingerprint-manager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "author": "Fedora Fingerprint Manager contributors",
   "homepage": "https://github.com/Terrydaktal/libfprint-fpc-10a5-9924",
